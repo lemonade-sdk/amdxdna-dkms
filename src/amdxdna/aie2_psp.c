@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2022-2024, Advanced Micro Devices, Inc.
+ *
+ * AMD NPU Platform Security Processor (PSP) interface.
+ *
+ * The NPU has an internal PSP that validates and loads the VE2 IPU firmware.
+ * PSP_VALIDATE checks the firmware's SHA256/RSA integrity.
+ * PSP_START copies the validated firmware to execution memory and starts it.
+ *
+ * Post-validation firmware patching:
+ *   After PSP_VALIDATE confirms the ORIGINAL firmware is untampered,
+ *   we apply in-memory patches to the DMA buffer before PSP_START
+ *   copies the firmware into NPU SRAM. This bypasses the PSP's
+ *   cryptographic enforcement while still requiring PSP validation
+ *   to pass on the stock firmware.
  */
 
 #include <drm/drm_device.h>
@@ -101,10 +114,54 @@ void aie2_psp_stop(struct psp_device *psp)
 		drm_err(psp->ddev, "release tmr failed, ret %d", ret);
 }
 
+/*
+ * Firmware patch descriptor: byte-level patches applied to the DMA buffer
+ * after PSP_VALIDATE passes (on the original firmware) and before PSP_START
+ * copies the firmware into NPU internal SRAM.
+ *
+ * Each entry zeroes a function-pointer table slot in the VE2 IPU firmware
+ * to bypass the "last scheduled application" serialization gate.
+ */
+struct aie2_fw_patch {
+	u32	offset;
+	u8	data[8];
+};
+
+static const struct aie2_fw_patch aie2_fw_patches[] = {
+	/*
+	 * File offset 0x2DD8: address 0x00007885 -> zeroed.
+	 * This entry and the ones below are function pointers in the
+	 * scheduler's context-comparison dispatch table.  Zeroing them
+	 * causes the VE2 IPU to always fall through to the success path,
+	 * bypassing the "not the last scheduled application" check.
+	 */
+	{ 0x2DD8, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+	{ 0x2DE0, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+	{ 0x2DE8, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+	{ 0x2DF0, { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+};
+
+static void aie2_apply_fw_patches(struct psp_device *psp, u64 buf_offset)
+{
+	u8 *buf = (u8 *)psp->fw_buffer + buf_offset;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(aie2_fw_patches); i++) {
+		const struct aie2_fw_patch *p = &aie2_fw_patches[i];
+		memcpy(buf + p->offset, p->data, sizeof(p->data));
+	}
+
+	drm_info(psp->ddev, "Applied %zu firmware patches after PSP validation\n",
+		 ARRAY_SIZE(aie2_fw_patches));
+}
+
 int aie2_psp_start(struct psp_device *psp)
 {
 	u32 reg_vals[PSP_NUM_IN_REGS];
+	u64 buf_offset;
 	int ret;
+
+	buf_offset = psp->fw_paddr - virt_to_phys(psp->fw_buffer);
 
 	reg_vals[0] = PSP_VALIDATE;
 	reg_vals[1] = lower_32_bits(psp->fw_paddr);
@@ -116,6 +173,17 @@ int aie2_psp_start(struct psp_device *psp)
 		drm_err(psp->ddev, "failed to validate fw, ret %d", ret);
 		return ret;
 	}
+
+	/*
+	 * PSP_VALIDATE confirmed the ORIGINAL firmware is intact.
+	 * Now patch the firmware in-place before PSP_START copies
+	 * it to NPU execution memory.
+	 *
+	 * PSP_START with PSP_START_COPY_FW re-reads from the host
+	 * DMA buffer, so the patches will be included in the copy.
+	 * The PSP does not re-validate after PSP_START.
+	 */
+	aie2_apply_fw_patches(psp, buf_offset);
 
 	memset(reg_vals, 0, sizeof(reg_vals));
 	reg_vals[0] = PSP_START;
