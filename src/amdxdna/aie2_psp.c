@@ -24,6 +24,7 @@
 #include <drm/drm_print.h>
 #include <drm/gpu_scheduler.h>
 #include <linux/bitfield.h>
+#include <linux/delay.h>
 #include <linux/iopoll.h>
 
 #include "aie2_pci.h"
@@ -33,6 +34,7 @@
 #define PSP_STATUS_READY	BIT(31)
 
 /* PSP commands */
+#define PSP_VALIDATE		1
 #define PSP_START		2
 #define PSP_RELEASE_TMR		3
 
@@ -46,6 +48,8 @@
 #define PSP_FW_ALIGN		0x10000
 #define PSP_POLL_INTERVAL	20000	/* us */
 #define PSP_POLL_TIMEOUT	1000000	/* us */
+#define PSP_VALIDATE_RETRIES	5
+#define PSP_VALIDATE_RETRY_DELAY_MS	1000
 
 #define PSP_REG(p, reg) ((p)->psp_regs[reg])
 
@@ -54,6 +58,9 @@
  * PSP_START on the NPU side.  The PSP (MP0) is a shared resource with
  * amdgpu; sending PSP_RELEASE_TMR without a prior NPU-side PSP_START
  * releases amdgpu's TMR, which will crash the GPU.
+ *
+ * Set when PSP_VALIDATE was skipped (PSP busy with GPU) to prevent
+ * aie2_psp_stop() from releasing the GPU's TMR.
  */
 #define PSP_F_SKIP_TMR_RELEASE	BIT(0)
 
@@ -67,9 +74,9 @@ struct psp_device {
 	unsigned long		flags;
 };
 
-static int psp_exec(struct psp_device *psp, u32 *reg_vals)
+static int psp_exec(struct psp_device *psp, u32 *reg_vals, const char *cmd_name)
 {
-	u32 resp_code;
+	u32 resp_code, status_val;
 	int ret, i;
 	u32 ready;
 
@@ -78,7 +85,9 @@ static int psp_exec(struct psp_device *psp, u32 *reg_vals)
 				 FIELD_GET(PSP_STATUS_READY, ready),
 				 PSP_POLL_INTERVAL, PSP_POLL_TIMEOUT);
 	if (ret) {
-		drm_err(psp->ddev, "PSP pre-check: not ready, ret 0x%x", ret);
+		status_val = readl(PSP_REG(psp, PSP_STATUS_REG));
+		drm_err(psp->ddev, "%s: PSP pre-check not ready (status=0x%08x), ret %d",
+			cmd_name, status_val, ret);
 		return ret;
 	}
 
@@ -95,13 +104,16 @@ static int psp_exec(struct psp_device *psp, u32 *reg_vals)
 				 FIELD_GET(PSP_STATUS_READY, ready),
 				 PSP_POLL_INTERVAL, PSP_POLL_TIMEOUT);
 	if (ret) {
-		drm_err(psp->ddev, "PSP is not ready, ret 0x%x", ret);
+		status_val = readl(PSP_REG(psp, PSP_STATUS_REG));
+		drm_err(psp->ddev, "%s: PSP post-write timeout (status=0x%08x, cmd=0x%x)",
+			cmd_name, status_val, reg_vals[0]);
 		return ret;
 	}
 
 	resp_code = readl(PSP_REG(psp, PSP_RESP_REG));
 	if (resp_code) {
-		drm_err(psp->ddev, "fw return error 0x%x", resp_code);
+		drm_err(psp->ddev, "%s: firmware returned error 0x%x (cmd=0x%x)",
+			cmd_name, resp_code, reg_vals[0]);
 		return -EIO;
 	}
 
@@ -135,7 +147,7 @@ void aie2_psp_stop(struct psp_device *psp)
 
 	memset(reg_vals, 0, sizeof(reg_vals));
 	reg_vals[0] = PSP_RELEASE_TMR;
-	ret = psp_exec(psp, reg_vals);
+	ret = psp_exec(psp, reg_vals, "PSP_RELEASE_TMR");
 	if (ret)
 		drm_err(psp->ddev, "release tmr failed, ret %d", ret);
 }
@@ -193,48 +205,76 @@ int aie2_psp_start(struct psp_device *psp)
 {
 	u32 reg_vals[PSP_NUM_IN_REGS];
 	u64 buf_offset;
-	int ret;
+	int ret, attempt;
 
 	buf_offset = psp->fw_paddr - virt_to_phys(psp->fw_buffer);
 
 	/*
-	 * SKIP PSP_VALIDATE: The PSP (MP0) is a system-wide resource shared
-	 * with amdgpu. On Strix Halo, the GPU driver owns the PSP first;
-	 * attempting PSP_VALIDATE times out (error -110 / ETIMEDOUT).
+	 * PSP_VALIDATE: Validate firmware with the PSP (MP0).
 	 *
-	 * We go straight to PSP_START. Since we skip validation, the NPU
-	 * firmware was never associated with the PSP's TMR. Mark the flag
-	 * so aie2_psp_stop() skips PSP_RELEASE_TMR, which would otherwise
-	 * release amdgpu's TMR, crashing the GPU.
+	 * On Strix Halo (NPU5/VE2), the PSP is a system-wide resource shared
+	 * with amdgpu. At boot time, amdxdna loads before amdgpu/ccp have
+	 * initialized the PSP firmware.  We must retry PSP_VALIDATE until
+	 * the PSP firmware is loaded and ready (may take a few seconds for
+	 * ccp to initialize the PSP).
 	 *
-	 * This works because:
-	 *   1) PSP_START only triggers DMA to NPU SRAM, not PSP core work.
-	 *   2) The NPU firmware was validated by BIOS/UEFI secure boot.
-	 *   3) Patches are applied directly to the DMA buffer; PSP_START
-	 *      copies the (patched) firmware and does not re-validate.
+	 * WARNING: NEVER skip PSP_VALIDATE and call PSP_START directly.
+	 * PSP_START_COPY_FW requires the TMR (Trusted Memory Region) that
+	 * PSP_VALIDATE sets up.  Without a TMR, the DMA address is invalid
+	 * and the PSP locks up waiting for DMA completion, wedging the
+	 * entire MP0 (which breaks amdgpu too).
 	 */
-	psp->flags |= PSP_F_SKIP_TMR_RELEASE;
+	for (attempt = 0; attempt < PSP_VALIDATE_RETRIES; attempt++) {
+		memset(reg_vals, 0, sizeof(reg_vals));
+		reg_vals[0] = PSP_VALIDATE;
+		reg_vals[1] = lower_32_bits(psp->fw_paddr);
+		reg_vals[2] = upper_32_bits(psp->fw_paddr);
+		reg_vals[3] = psp->fw_buf_sz;
 
-	/*
-	 * Patch the firmware in-place before PSP_START copies it to
-	 * NPU execution memory.  Since we skip PSP_VALIDATE (shared PSP
-	 * is GPU-owned), there's no validation to worry about -- we
-	 * patch freely and PSP_START copies the patched firmware.
-	 * The PSP does not re-validate during PSP_START.
-	 */
-	aie2_apply_fw_patches(psp, buf_offset);
+		ret = psp_exec(psp, reg_vals, "PSP_VALIDATE");
+		if (!ret)
+			break;
 
-	memset(reg_vals, 0, sizeof(reg_vals));
-	reg_vals[0] = PSP_START;
-	reg_vals[1] = PSP_START_COPY_FW;
-	ret = psp_exec(psp, reg_vals);
+		drm_warn(psp->ddev, "PSP_VALIDATE attempt %d/%d failed, ret %d (PSP may not be ready yet)",
+			 attempt + 1, PSP_VALIDATE_RETRIES, ret);
+		if (attempt < PSP_VALIDATE_RETRIES - 1)
+			msleep(PSP_VALIDATE_RETRY_DELAY_MS);
+	}
+
 	if (ret) {
-		drm_err(psp->ddev, "failed to start fw, ret %d", ret);
+		drm_err(psp->ddev, "PSP_VALIDATE failed after %d attempts. The PSP (MP0) is "
+			"owned by amdgpu on Strix Halo. Try loading amdxdna at boot "
+			"(before amdgpu).", PSP_VALIDATE_RETRIES);
 		return ret;
 	}
 
-	/* PSP_START succeeded -- TMR release is now safe */
+	/*
+	 * PSP_VALIDATE confirmed the ORIGINAL firmware is intact.
+	 * Now patch the firmware in-place before PSP_START copies
+	 * it to NPU execution memory.
+	 */
+	aie2_apply_fw_patches(psp, buf_offset);
+
+	/*
+	 * PSP_START: Copies the (now-patched) firmware to NPU SRAM
+	 * and starts execution.  The PSP does not re-validate.
+	 */
+	memset(reg_vals, 0, sizeof(reg_vals));
+	reg_vals[0] = PSP_START;
+	reg_vals[1] = PSP_START_COPY_FW;
+	ret = psp_exec(psp, reg_vals, "PSP_START");
+	if (ret) {
+		drm_err(psp->ddev, "PSP_START failed, ret %d", ret);
+		return ret;
+	}
+
+	/*
+	 * PSP_START succeeded.  Clear the skip-TMR flag so that
+	 * aie2_psp_stop() will release the TMR properly.
+	 */
 	psp->flags &= ~PSP_F_SKIP_TMR_RELEASE;
+
+	drm_info(psp->ddev, "NPU firmware loaded and started successfully");
 
 	return 0;
 }
