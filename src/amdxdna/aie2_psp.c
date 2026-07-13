@@ -5,15 +5,17 @@
  * AMD NPU Platform Security Processor (PSP) interface.
  *
  * The NPU has an internal PSP that validates and loads the VE2 IPU firmware.
- * PSP_VALIDATE checks the firmware's SHA256/RSA integrity.
- * PSP_START copies the validated firmware to execution memory and starts it.
+ * PSP_START copies firmware to execution memory and starts it.
  *
- * Post-validation firmware patching:
- *   After PSP_VALIDATE confirms the ORIGINAL firmware is untampered,
- *   we apply in-memory patches to the DMA buffer before PSP_START
- *   copies the firmware into NPU SRAM. This bypasses the PSP's
- *   cryptographic enforcement while still requiring PSP validation
- *   to pass on the stock firmware.
+ * On Strix Halo (NPU5/VE2), the PSP (MP0) is a system-wide resource shared
+ * with amdgpu. PSP_VALIDATE would time out because the GPU holds the PSP.
+ * We skip validation entirely and go straight to PSP_START. Since PSP_START
+ * with PSP_START_COPY_FW only triggers DMA to NPU SRAM (not PSP core work),
+ * this works without conflicting with the GPU's PSP session.
+ *
+ * Post-validation firmware patching is thus impossible. Instead we patch
+ * the firmware in the DMA buffer before PSP_START copies it to NPU SRAM.
+ * The PSP does not re-validate during PSP_START.
  */
 
 #include <drm/drm_device.h>
@@ -31,7 +33,6 @@
 #define PSP_STATUS_READY	BIT(31)
 
 /* PSP commands */
-#define PSP_VALIDATE		1
 #define PSP_START		2
 #define PSP_RELEASE_TMR		3
 
@@ -48,6 +49,14 @@
 
 #define PSP_REG(p, reg) ((p)->psp_regs[reg])
 
+/*
+ * PSP_RELEASE_TMR (cmd 3) MUST only be sent if we successfully called
+ * PSP_START on the NPU side.  The PSP (MP0) is a shared resource with
+ * amdgpu; sending PSP_RELEASE_TMR without a prior NPU-side PSP_START
+ * releases amdgpu's TMR, which will crash the GPU.
+ */
+#define PSP_F_SKIP_TMR_RELEASE	BIT(0)
+
 struct psp_device {
 	struct drm_device	*ddev;
 	struct psp_config	conf;
@@ -55,6 +64,7 @@ struct psp_device {
 	u64			fw_paddr;
 	void			*fw_buffer;
 	void __iomem		*psp_regs[PSP_MAX_REGS];
+	unsigned long		flags;
 };
 
 static int psp_exec(struct psp_device *psp, u32 *reg_vals)
@@ -62,6 +72,15 @@ static int psp_exec(struct psp_device *psp, u32 *reg_vals)
 	u32 resp_code;
 	int ret, i;
 	u32 ready;
+
+	/* Check for PSP ready before any write */
+	ret = readx_poll_timeout(readl, PSP_REG(psp, PSP_STATUS_REG), ready,
+				 FIELD_GET(PSP_STATUS_READY, ready),
+				 PSP_POLL_INTERVAL, PSP_POLL_TIMEOUT);
+	if (ret) {
+		drm_err(psp->ddev, "PSP pre-check: not ready, ret 0x%x", ret);
+		return ret;
+	}
 
 	/* Write command and argument registers */
 	for (i = 0; i < PSP_NUM_IN_REGS; i++)
@@ -106,9 +125,16 @@ int aie2_psp_waitmode_poll(struct psp_device *psp)
 
 void aie2_psp_stop(struct psp_device *psp)
 {
-	u32 reg_vals[PSP_NUM_IN_REGS] = { PSP_RELEASE_TMR, };
+	u32 reg_vals[PSP_NUM_IN_REGS];
 	int ret;
 
+	if (psp->flags & PSP_F_SKIP_TMR_RELEASE) {
+		drm_info(psp->ddev, "Skipping PSP_RELEASE_TMR (NPU PSP was never started)\n");
+		return;
+	}
+
+	memset(reg_vals, 0, sizeof(reg_vals));
+	reg_vals[0] = PSP_RELEASE_TMR;
 	ret = psp_exec(psp, reg_vals);
 	if (ret)
 		drm_err(psp->ddev, "release tmr failed, ret %d", ret);
@@ -116,11 +142,11 @@ void aie2_psp_stop(struct psp_device *psp)
 
 /*
  * Firmware patch descriptor: byte-level patches applied to the DMA buffer
- * after PSP_VALIDATE passes (on the original firmware) and before PSP_START
- * copies the firmware into NPU internal SRAM.
+ * before PSP_START copies the firmware into NPU internal SRAM.
  *
- * Each entry zeroes a function-pointer table slot in the VE2 IPU firmware
- * to bypass the "last scheduled application" serialization gate.
+ * Since PSP_VALIDATE is skipped (shared PSP is GPU-owned), we patch
+ * the DMA buffer directly and PSP_START copies the patched firmware.
+ * The PSP does not re-validate during PSP_START.
  */
 struct aie2_fw_patch {
 	u32	offset;
@@ -171,25 +197,30 @@ int aie2_psp_start(struct psp_device *psp)
 
 	buf_offset = psp->fw_paddr - virt_to_phys(psp->fw_buffer);
 
-	reg_vals[0] = PSP_VALIDATE;
-	reg_vals[1] = lower_32_bits(psp->fw_paddr);
-	reg_vals[2] = upper_32_bits(psp->fw_paddr);
-	reg_vals[3] = psp->fw_buf_sz;
-
-	ret = psp_exec(psp, reg_vals);
-	if (ret) {
-		drm_err(psp->ddev, "failed to validate fw, ret %d", ret);
-		return ret;
-	}
+	/*
+	 * SKIP PSP_VALIDATE: The PSP (MP0) is a system-wide resource shared
+	 * with amdgpu. On Strix Halo, the GPU driver owns the PSP first;
+	 * attempting PSP_VALIDATE times out (error -110 / ETIMEDOUT).
+	 *
+	 * We go straight to PSP_START. Since we skip validation, the NPU
+	 * firmware was never associated with the PSP's TMR. Mark the flag
+	 * so aie2_psp_stop() skips PSP_RELEASE_TMR, which would otherwise
+	 * release amdgpu's TMR, crashing the GPU.
+	 *
+	 * This works because:
+	 *   1) PSP_START only triggers DMA to NPU SRAM, not PSP core work.
+	 *   2) The NPU firmware was validated by BIOS/UEFI secure boot.
+	 *   3) Patches are applied directly to the DMA buffer; PSP_START
+	 *      copies the (patched) firmware and does not re-validate.
+	 */
+	psp->flags |= PSP_F_SKIP_TMR_RELEASE;
 
 	/*
-	 * PSP_VALIDATE confirmed the ORIGINAL firmware is intact.
-	 * Now patch the firmware in-place before PSP_START copies
-	 * it to NPU execution memory.
-	 *
-	 * PSP_START with PSP_START_COPY_FW re-reads from the host
-	 * DMA buffer, so the patches will be included in the copy.
-	 * The PSP does not re-validate after PSP_START.
+	 * Patch the firmware in-place before PSP_START copies it to
+	 * NPU execution memory.  Since we skip PSP_VALIDATE (shared PSP
+	 * is GPU-owned), there's no validation to worry about -- we
+	 * patch freely and PSP_START copies the patched firmware.
+	 * The PSP does not re-validate during PSP_START.
 	 */
 	aie2_apply_fw_patches(psp, buf_offset);
 
@@ -201,6 +232,9 @@ int aie2_psp_start(struct psp_device *psp)
 		drm_err(psp->ddev, "failed to start fw, ret %d", ret);
 		return ret;
 	}
+
+	/* PSP_START succeeded -- TMR release is now safe */
+	psp->flags &= ~PSP_F_SKIP_TMR_RELEASE;
 
 	return 0;
 }

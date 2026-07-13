@@ -454,7 +454,9 @@ stop_fw:
 	xdna_mailbox_stop_channel(ndev->mgmt_chann);
 stop_psp:
 	aie2_psp_stop(ndev->psp_hdl);
+	goto fini_smu;
 stop_psp_no_smu:
+	/* SMU not initialized yet -- skip SMU fini */
 	goto free_channel;
 fini_smu:
 	aie2_smu_fini(ndev);
