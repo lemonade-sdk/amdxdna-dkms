@@ -1,6 +1,14 @@
---- drivers/accel/amdxdna/amdxdna_gem.c	2026-07-10 19:51:15.490398306 -0300
-+++ drivers/accel/amdxdna/amdxdna_gem.c	2026-07-10 19:58:16.554900692 -0300
-@@ -168,6 +168,8 @@
+--- drivers/accel/amdxdna/drivers/accel/amdxdna/amdxdna_gem.c	2026-07-10 20:04:34.058875594 -0300
++++ drivers/accel/amdxdna/amdxdna_gem.c	2026-07-10 20:04:28.596708831 -0300
+@@ -12,6 +12,7 @@
+ #include <drm/gpu_scheduler.h>
+ #include <linux/dma-buf.h>
+ #include <linux/dma-direct.h>
++#include <linux/delay.h>
+ #include <linux/iosys-map.h>
+ #include <linux/pagemap.h>
+ #include <linux/vmalloc.h>
+@@ -168,6 +169,8 @@
  	mmu_interval_notifier_remove(&mapp->notifier);
  	if (is_import_bo(mapp->abo) && vma->vm_file && vma->vm_file->f_mapping)
  		mapping_clear_unevictable(vma->vm_file->f_mapping);
@@ -9,7 +17,7 @@
  
  	xdna = to_xdna_dev(to_gobj(mapp->abo)->dev);
  	down_write(&xdna->notifier_lock);
-@@ -238,6 +240,8 @@
+@@ -238,6 +241,8 @@
  	INIT_WORK(&mapp->hmm_unreg_work, amdxdna_hmm_unreg_work);
  	if (is_import_bo(abo) && vma->vm_file && vma->vm_file->f_mapping)
  		mapping_set_unevictable(vma->vm_file->f_mapping);
@@ -18,7 +26,7 @@
  
  	down_write(&xdna->notifier_lock);
  	list_add_tail(&mapp->node, &abo->mem.umap_list);
-@@ -273,9 +277,15 @@
+@@ -273,9 +278,15 @@
  	unsigned long num_pages = vma_pages(vma);
  	unsigned long offset = 0;
  	int ret;
@@ -34,7 +42,7 @@
  		if (ret) {
  			XDNA_ERR(xdna, "Failed shmem mmap %d", ret);
  			return ret;
-@@ -283,10 +293,16 @@
+@@ -283,10 +294,16 @@
  
  		/* The buffer is based on memory pages. Fix the flag. */
  		vm_flags_mod(vma, VM_MIXEDMAP, VM_PFNMAP);
@@ -52,7 +60,7 @@
  			vma->vm_ops->close(vma);
  			return ret;
  		}
-@@ -294,6 +310,7 @@
+@@ -294,6 +311,7 @@
  		return 0;
  	}
  
@@ -60,7 +68,7 @@
  	vma->vm_private_data = NULL;
  	vma->vm_ops = NULL;
  	ret = dma_buf_mmap(abo->dma_buf, vma, 0);
-@@ -455,8 +472,8 @@
+@@ -455,8 +473,8 @@
  
  	XDNA_DBG(xdna, "BO type %d xdna_addr 0x%llx", abo->type, abo->mem.dev_addr);
  

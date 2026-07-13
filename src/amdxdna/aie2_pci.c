@@ -254,7 +254,10 @@ static int aie2_mgmt_fw_query(struct amdxdna_dev_hdl *ndev)
 		return ret;
 	}
 
-	ndev->total_col = min(aie2_max_col, ndev->metadata.cols);
+	/* HACK: bypass firmware-reported column count — use kernel param directly */
+	ndev->total_col = aie2_max_col;
+	XDNA_WARN(ndev->xdna, "OVERRIDE: total_col=%d (fw reported %d)",
+		  ndev->total_col, ndev->metadata.cols);
 
 	return 0;
 }
