@@ -9,7 +9,8 @@ This package provides the AMD XDNA NPU (Neural Processing Unit) driver as a DKMS
 ## Supported Kernels
 
 - Linux 6.17 (Ubuntu OEM and HWE kernels)
-- Linux 6.18
+- Linux 6.18, 6.19
+- Linux 7.0 – 7.2
 
 The package is designed to work with Ubuntu 24.04 LTS kernel variants:
 - linux-oem-24.04 (6.17)
