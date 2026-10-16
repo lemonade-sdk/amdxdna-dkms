@@ -109,7 +109,7 @@ cat > "$PROJECT_ROOT/src/amdxdna/Makefile" << 'EOF'
 
 # Prepend our include paths to ensure bundled headers override system ones
 # This is critical because 6.14 kernels may ship with older amdxdna_accel.h
-LINUXINCLUDE := -I$(src)/include/uapi -I$(src)/trace $(LINUXINCLUDE)
+LINUXINCLUDE := -I$(src)/include/uapi -I$(src) $(LINUXINCLUDE)
 
 EOF
 
